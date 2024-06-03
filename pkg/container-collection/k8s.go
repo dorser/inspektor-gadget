@@ -99,6 +99,10 @@ func (k *K8sClient) Close() {
 	k.runtimeClient.Close()
 }
 
+func (k *K8sClient) RuntimeClient() runtimeclient.ContainerRuntimeClient {
+	return k.runtimeClient
+}
+
 // trimRuntimePrefix removes the runtime prefix from a container ID.
 func trimRuntimePrefix(id string) string {
 	parts := strings.SplitN(id, "//", 2)

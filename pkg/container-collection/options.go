@@ -236,38 +236,94 @@ func WithContainerRuntimeEnrichment(runtime *containerutilsTypes.RuntimeConfig) 
 	}
 }
 
+func WithContainerRuntimeClientEnrichment(runtimeClient runtimeclient.ContainerRuntimeClient) ContainerCollectionOption {
+	return func(cc *ContainerCollection) error {
+		//TODO: runtime.Name
+		// switch runtime.Name {
+		// case types.RuntimeNamePodman:
+		// 	// Podman only supports runtime enrichment for initial containers otherwise it will deadlock.
+		// 	// As a consequence, we need to ensure that new podman containers will be enriched with all
+		// 	// the information via other enrichers e.g. see RuncNotifier.futureContainers implementation
+		// 	// to see how container name is enriched.
+		// default:
+		// 	// Add the enricher for future containers even if enriching the current
+		// 	// containers fails. We do it because the runtime could be temporarily
+		// 	// unavailable and once it is up, we will start receiving the
+		// 	// notifications for its containers thus we will be able to enrich them.
+		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
+			//TODO: runtime.Name
+			return containerRuntimeEnricher("DOR", runtimeClient, container)
+		})
+		// }
+
+		// Enrich already running containers
+		containers, err := runtimeClient.GetContainers()
+		if err != nil {
+			if !cc.disableContainerRuntimeWarnings {
+				log.Warnf("Runtime enricher (%s): couldn't get current containers: %s",
+					//TODO: runtime.Name
+					"@@@DORDOR", err)
+			}
+			return nil
+		}
+		for _, container := range containers {
+			if container.Runtime.State != runtimeclient.StateRunning {
+				//TODO: runtime.Name
+				log.Debugf("Runtime enricher(%s): Skip container %q (ID: %s): not running",
+					"@@@@@DORDOR", container.Runtime.ContainerName, container.Runtime.ContainerID)
+				continue
+			}
+
+			containerDetails, err := runtimeClient.GetContainerDetails(container.Runtime.ContainerID)
+			if err != nil {
+				log.Debugf("Runtime enricher (%s): Skip container %q (ID: %s): couldn't find container: %s",
+					//TODO: container.Name
+					"@@@@@@@@@DORDOR", container.Runtime.ContainerName, container.Runtime.ContainerID, err)
+				continue
+			}
+
+			pid := containerDetails.Pid
+			if pid > math.MaxUint32 {
+				log.Errorf("Container PID (%d) exceeds math.MaxUint32 (%d), skipping this container", pid, math.MaxUint32)
+				continue
+			}
+
+			var c Container
+			c.Pid = uint32(pid)
+			enrichContainerWithContainerData(&containerDetails.ContainerData, &c)
+			cc.initialContainers = append(cc.initialContainers, &c)
+		}
+
+		return nil
+	}
+}
+
 // WithPodInformer uses a pod informer to get both initial containers and the
 // stream of container events. It then uses the CRI interface to get the
 // process ID.
 //
 // This cannot be used together with WithInitialKubernetesContainers() since
 // the pod informer already gets initial containers.
-func WithPodInformer(nodeName string) ContainerCollectionOption {
-	return withPodInformer(nodeName, false)
+func WithPodInformer(nodeName string, k8sClient *K8sClient) ContainerCollectionOption {
+	return withPodInformer(nodeName, false, k8sClient)
 }
 
 // WithFallbackPodInformer uses a pod informer as a fallback mechanism to a main
 // hook. If the podinformer detects a new container and it hasn't been added to
 // the list of containers it means the main hook is not working fine. We warn
 // the user about it.
-func WithFallbackPodInformer(nodeName string) ContainerCollectionOption {
-	return withPodInformer(nodeName, true)
+func WithFallbackPodInformer(nodeName string, k8sClient *K8sClient) ContainerCollectionOption {
+	return withPodInformer(nodeName, true, k8sClient)
 }
 
-func withPodInformer(nodeName string, fallbackMode bool) ContainerCollectionOption {
+func withPodInformer(nodeName string, fallbackMode bool, k8sClient *K8sClient) ContainerCollectionOption {
 	return func(cc *ContainerCollection) error {
-		k8sClient, err := NewK8sClient(nodeName)
-		if err != nil {
-			return fmt.Errorf("creating Kubernetes client: %w", err)
-		}
-
 		podInformer, err := NewPodInformer(nodeName)
 		if err != nil {
 			return fmt.Errorf("creating pod informer: %w", err)
 		}
 
 		cc.cleanUpFuncs = append(cc.cleanUpFuncs, func() {
-			k8sClient.Close()
 			podInformer.Stop()
 		})
 
@@ -362,14 +418,8 @@ func WithHost() ContainerCollectionOption {
 //
 // This cannot be used together with WithPodInformer() since the pod informer
 // already gets initial containers.
-func WithInitialKubernetesContainers(nodeName string) ContainerCollectionOption {
+func WithInitialKubernetesContainers(nodeName string, k8sClient *K8sClient) ContainerCollectionOption {
 	return func(cc *ContainerCollection) error {
-		k8sClient, err := NewK8sClient(nodeName)
-		if err != nil {
-			return fmt.Errorf("creating Kubernetes client: %w", err)
-		}
-		defer k8sClient.Close()
-
 		containers, err := k8sClient.ListContainers()
 		if err != nil {
 			return fmt.Errorf("listing containers: %w", err)

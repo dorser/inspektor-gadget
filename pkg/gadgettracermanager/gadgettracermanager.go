@@ -254,12 +254,17 @@ func NewServer(conf *Conf) (*GadgetTracerManager, error) {
 		containercollection.WithNodeName(conf.NodeName),
 	}
 
+	k8sClient, err := containercollection.NewK8sClient(conf.NodeName)
+	if err != nil {
+		return nil, fmt.Errorf("creating Kubernetes client: %w", err)
+	}
+	defer k8sClient.Close()
+
 	if !conf.TestOnly {
 		if err := rlimit.RemoveMemlock(); err != nil {
 			return nil, err
 		}
 
-		var err error
 		if g.containersMap, err = containersmap.NewContainersMap(gadgets.PinPath); err != nil {
 			return nil, fmt.Errorf("creating containers map: %w", err)
 		}
@@ -279,41 +284,46 @@ func NewServer(conf *Conf) (*GadgetTracerManager, error) {
 		// Used by nri and crio
 		log.Infof("GadgetTracerManager: hook mode: none")
 		if !conf.TestOnly {
-			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
+			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName, k8sClient))
 		}
 	case "auto":
 		if containerhook.Supported() {
 			log.Infof("GadgetTracerManager: hook mode: fanotify+ebpf (auto)")
 			opts = append(opts, containercollection.WithContainerFanotifyEbpf())
-			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
+			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName, k8sClient))
 		} else if runcfanotify.Supported() {
 			log.Infof("GadgetTracerManager: hook mode: fanotify (auto)")
 			opts = append(opts, containercollection.WithRuncFanotify())
-			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
+			opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName, k8sClient))
 		} else {
 			log.Infof("GadgetTracerManager: hook mode: podinformer (auto)")
-			opts = append(opts, containercollection.WithPodInformer(g.nodeName))
+			opts = append(opts, containercollection.WithPodInformer(g.nodeName, k8sClient))
 			podInformerUsed = true
 		}
 	case "podinformer":
 		log.Infof("GadgetTracerManager: hook mode: podinformer")
-		opts = append(opts, containercollection.WithPodInformer(g.nodeName))
+		opts = append(opts, containercollection.WithPodInformer(g.nodeName, k8sClient))
 		podInformerUsed = true
 	case "fanotify":
 		log.Infof("GadgetTracerManager: hook mode: fanotify")
 		opts = append(opts, containercollection.WithRuncFanotify())
-		opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
+		opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName, k8sClient))
 	case "fanotify+ebpf":
 		log.Infof("GadgetTracerManager: hook mode: fanotify+ebpf")
 		opts = append(opts, containercollection.WithContainerFanotifyEbpf())
-		opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName))
+		opts = append(opts, containercollection.WithInitialKubernetesContainers(g.nodeName, k8sClient))
 	default:
 		return nil, fmt.Errorf("invalid hook mode: %s", conf.HookMode)
 	}
 
 	if conf.FallbackPodInformer && !podInformerUsed {
 		log.Infof("GadgetTracerManager: enabling fallback podinformer")
-		opts = append(opts, containercollection.WithFallbackPodInformer(g.nodeName))
+		opts = append(opts, containercollection.WithFallbackPodInformer(g.nodeName, k8sClient))
+	}
+
+	if conf.RuntimeEnrichment {
+		log.Infof("GadgetTracerManager: enabling container runtime enrichment")
+		opts = append(opts, containercollection.WithContainerRuntimeClientEnrichment(k8sClient.RuntimeClient()))
 	}
 
 	err = g.ContainerCollection.Initialize(opts...)
@@ -340,6 +350,7 @@ type Conf struct {
 	HookMode            string
 	FallbackPodInformer bool
 	TestOnly            bool
+	RuntimeEnrichment   bool
 }
 
 // Close releases any resource that could be in use by the tracer manager, like
