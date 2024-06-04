@@ -60,6 +60,9 @@ func enrichContainerWithContainerData(containerData *runtimeclient.ContainerData
 	setIfEmptyStr(&container.Runtime.ContainerName, containerData.Runtime.ContainerName)
 	setIfEmptyStr(&container.Runtime.ContainerImageName, containerData.Runtime.ContainerImageName)
 	setIfEmptyStr(&container.Runtime.ContainerImageDigest, containerData.Runtime.ContainerImageDigest)
+	if container.Runtime.ContainerCreatedAt == 0 {
+		container.Runtime.ContainerCreatedAt = containerData.Runtime.ContainerCreatedAt
+	}
 
 	// Kubernetes
 	setIfEmptyStr(&container.K8s.Namespace, containerData.K8s.Namespace)
