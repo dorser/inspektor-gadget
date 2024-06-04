@@ -176,12 +176,20 @@ func (c *DockerClient) GetContainerDetails(containerID string) (*runtimeclient.C
 		return nil, errors.New("container host config is nil")
 	}
 
+	containerCreatedAtTimestamp, err := time.Parse(time.RFC3339Nano, containerJSON.Created)
+	if err != nil {
+		return nil, err
+	}
+
+	containerCreatedAt := containerCreatedAtTimestamp.Unix()
+
 	containerData := buildContainerData(
 		containerJSON.ID,
 		containerJSON.Name,
 		containerJSON.Config.Image,
 		containerJSON.State.Status,
-		containerJSON.Config.Labels)
+		containerJSON.Config.Labels,
+		containerCreatedAt)
 
 	containerDetailsData := runtimeclient.ContainerDetailsData{
 		ContainerData: *containerData,
@@ -253,7 +261,8 @@ func DockerContainerToContainerData(container *dockertypes.Container) *runtimecl
 		container.Names[0],
 		container.Image,
 		container.State,
-		container.Labels)
+		container.Labels,
+		container.Created)
 }
 
 // getContainerImageNamefromImage is a helper to parse the image string we get from Docker API
@@ -283,7 +292,7 @@ func getContainerImageNamefromImage(image string) string {
 // `buildContainerData` takes in basic metadata about a Docker container and
 // constructs a `runtimeclient.ContainerData` struct with this information. I also
 // enriches containers with the data and returns a pointer the created struct.
-func buildContainerData(containerID string, containerName string, containerImage string, state string, labels map[string]string) *runtimeclient.ContainerData {
+func buildContainerData(containerID string, containerName string, containerImage string, state string, labels map[string]string, createdAt int64) *runtimeclient.ContainerData {
 	containerData := runtimeclient.ContainerData{
 		Runtime: runtimeclient.RuntimeContainerData{
 			BasicRuntimeMetadata: types.BasicRuntimeMetadata{
@@ -291,6 +300,7 @@ func buildContainerData(containerID string, containerName string, containerImage
 				ContainerName:      strings.TrimPrefix(containerName, "/"),
 				RuntimeName:        types.RuntimeNameDocker,
 				ContainerImageName: getContainerImageNamefromImage(containerImage),
+				ContainerCreatedAt: createdAt,
 			},
 			State: containerStatusStateToRuntimeClientState(state),
 		},
