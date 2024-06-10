@@ -42,7 +42,8 @@ type snisnoopSocketsValue struct {
 	Sock              uint64
 	DeletionTimestamp uint64
 	Ipv6only          int8
-	_                 [7]byte
+	_                 [3]byte
+	Ppid              uint32
 }
 
 // loadSnisnoop returns the embedded CollectionSpec for snisnoop.

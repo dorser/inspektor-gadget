@@ -51,6 +51,7 @@ static __always_inline void insert_current_socket(struct sock *sock)
 	if (socket_key.family == AF_INET6)
 		socket_value.ipv6only = BPF_CORE_READ_BITFIELD_PROBED(
 			sock, __sk_common.skc_ipv6only);
+	socket_value.ppid = (pid_t)BPF_CORE_READ(task, real_parent, tgid);
 
 	bpf_map_update_elem(&gadget_sockets, &socket_key, &socket_value,
 			    BPF_ANY);

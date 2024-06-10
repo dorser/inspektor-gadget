@@ -42,6 +42,7 @@ static __always_inline void insert_socket_from_iter(struct sock *sock,
 	socket_value.sock = (__u64)sock;
 	socket_value.ipv6only =
 		BPF_CORE_READ_BITFIELD_PROBED(sock, __sk_common.skc_ipv6only);
+	socket_value.ppid = (pid_t)BPF_CORE_READ(task, real_parent, tgid);
 
 	// If the endpoint was not present, add it and we're done.
 	struct sockets_value *old_socket_value =

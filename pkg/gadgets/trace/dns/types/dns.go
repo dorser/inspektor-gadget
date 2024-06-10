@@ -39,8 +39,9 @@ type Event struct {
 	Tid  uint32 `json:"tid,omitempty" column:"tid,template:pid"`
 	Comm string `json:"comm,omitempty" column:"comm,template:comm"`
 
-	Uid uint32 `json:"uid" column:"uid,template:uid,hide"`
-	Gid uint32 `json:"gid" column:"gid,template:gid,hide"`
+	Uid  uint32 `json:"uid" column:"uid,template:uid,hide"`
+	Gid  uint32 `json:"gid" column:"gid,template:gid,hide"`
+	Ppid uint32 `json:"ppid,omitempty" column:"ppid,template:pid"`
 
 	SrcIP    string `json:"srcIP,omitempty" column:"srcIP,template:ipaddr,hide"`
 	DstIP    string `json:"dstIP,omitempty" column:"dstIP,template:ipaddr,hide"`
