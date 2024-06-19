@@ -15,6 +15,9 @@
 // Defined in include/uapi/linux/magic.h
 #define OVERLAYFS_SUPER_MAGIC 0x794c7630
 
+#define MEMFD_PREFIX "memfd:"
+#define MEMFD_PREFIX_LEN 6
+
 const volatile bool ignore_failed = true;
 const volatile uid_t targ_uid = INVALID_UID;
 const volatile int max_args = DEFAULT_MAXARGS;
@@ -206,6 +209,12 @@ static __always_inline bool has_upper_layer()
 			      ((void *)inode) +
 				      bpf_core_type_size(struct inode));
 	return upperdentry != NULL;
+}
+
+static __always_inline bool from_memfd(struct file *file) {
+	char name[MEMFD_PREFIX_LEN];
+  BPF_CORE_READ_STR_INTO(name, file, f_path.dentry, d_name.name);
+  return __builtin_memcmp(name, MEMFD_PREFIX, MEMFD_PREFIX_LEN) == 0;
 }
 
 SEC("tracepoint/syscalls/sys_exit_execve")
