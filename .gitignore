@@ -45,3 +45,4 @@ pkg/btfgen/btfs/arm64/*
 
 !gadgets/*.o
 !testdata/*.o
+ig-test

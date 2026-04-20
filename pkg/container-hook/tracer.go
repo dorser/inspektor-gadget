@@ -32,6 +32,7 @@
 package containerhook
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -43,6 +44,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -630,7 +632,7 @@ func checkFilesAreIdentical(path1, path2 string) (bool, error) {
 	return os.SameFile(f1, f2), nil
 }
 
-func (n *ContainerNotifier) monitorRuntimeInstance(mntnsId uint64, bundleDir string, pidFile string) error {
+func (n *ContainerNotifier) monitorRuntimeInstance(mntnsId uint64, bundleDir string, pidFile string, overrideContainerID string) error {
 	removeMarks := []func(){}
 
 	// The pidfile does not exist yet, so we cannot monitor it directly.
@@ -706,6 +708,9 @@ func (n *ContainerNotifier) monitorRuntimeInstance(mntnsId uint64, bundleDir str
 	// cri-o appends userdata to bundleDir,
 	// so we trim it here to get the correct containerID
 	containerID := filepath.Base(filepath.Clean(strings.TrimSuffix(bundleDir, "userdata")))
+	if overrideContainerID != "" {
+		containerID = overrideContainerID
+	}
 
 	n.pendingMu.Lock()
 	defer n.pendingMu.Unlock()
@@ -859,35 +864,379 @@ func (n *ContainerNotifier) parseConmonCmdline(cmdlineArr []string) {
 	n.futureMu.Unlock()
 }
 
-func (n *ContainerNotifier) parseOCIRuntime(mntnsId uint64, cmdlineArr []string) {
-	// Parse oci-runtime (runc/crun) command line
-	createFound := false
-	bundleDir := ""
-	pidFile := ""
+// readConfigJSON opens config.json with a size limit so that a pathological
+// config can't exhaust memory (mirrors callPreCreateContainerCallback).
+func readConfigJSON(configJSONPath string) ([]byte, error) {
+	f, err := os.Open(configJSONPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(io.LimitReader(f, configJsonMaxSize))
+}
 
-	for i := 0; i < len(cmdlineArr); i++ {
-		if cmdlineArr[i] == "create" {
-			createFound = true
-			continue
-		}
-		if cmdlineArr[i] == "--bundle" && i+1 < len(cmdlineArr) {
-			i++
-			bundleDir = filepath.Join(host.HostRoot, cmdlineArr[i])
-			continue
-		}
-		if cmdlineArr[i] == "--pid-file" && i+1 < len(cmdlineArr) {
-			i++
-			pidFile = filepath.Join(host.HostRoot, cmdlineArr[i])
-			continue
+// monitorRuntimeState polls runc's state directory for state.json to get the
+// container PID. This is used when --pid-file is not specified on the runc
+// command line (common for direct runc usage).
+//
+// runcPid is the PID of the runc process that was intercepted by fanotify and
+// is currently blocked on the ACCESS_PERM response. We use it to distinguish
+// runc itself from the container init (which is especially important for
+// containers sharing the host mount namespace, where the mntns coherence
+// check alone is insufficient).
+func (n *ContainerNotifier) monitorRuntimeState(bundleDir string, stateDir string, containerID string, runcPid int) error {
+	configJSONPath := filepath.Join(bundleDir, "config.json")
+	if _, err := os.Stat(configJSONPath); errors.Is(err, os.ErrNotExist) {
+		configJSONPath = filepath.Join(bundleDir, "userdata", "config.json")
+		if _, err := os.Stat(configJSONPath); errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("config not found at %s", configJSONPath)
 		}
 	}
 
-	if createFound && bundleDir != "" && pidFile != "" {
-		err := n.monitorRuntimeInstance(mntnsId, bundleDir, pidFile)
+	// Deduplicate: if we're already polling for this containerID, don't
+	// start a second goroutine. We use the pending map with a synthetic
+	// key (stateDir is unique per (runc-root, container-id)).
+	pendingKey := "runcstate:" + stateDir
+	n.pendingMu.Lock()
+	if _, alreadyPending := n.pendingContainers[pendingKey]; alreadyPending {
+		n.pendingMu.Unlock()
+		log.Debugf("monitorRuntimeState: already monitoring %s", stateDir)
+		return nil
+	}
+	n.pendingContainers[pendingKey] = &pendingContainer{
+		id:             containerID,
+		bundleDir:      bundleDir,
+		configJSONPath: configJSONPath,
+		timestamp:      time.Now(),
+	}
+	n.pendingMu.Unlock()
+
+	cleanup := func() {
+		n.pendingMu.Lock()
+		delete(n.pendingContainers, pendingKey)
+		n.pendingMu.Unlock()
+	}
+
+	// Emit pre-create callback with config.json (with size limit).
+	bundleConfigJSON, err := readConfigJSON(configJSONPath)
+	if err != nil {
+		log.Debugf("monitorRuntimeState: could not read config.json (%q): %s", configJSONPath, err)
+	} else {
+		n.callback(ContainerEvent{
+			Type:            EventTypePreCreateContainer,
+			ContainerID:     containerID,
+			ContainerConfig: string(bundleConfigJSON),
+			Bundle:          bundleDir,
+		})
+	}
+
+	n.wg.Add(1)
+	go func() {
+		defer n.wg.Done()
+		defer cleanup()
+
+		stateFile := filepath.Join(stateDir, "state.json")
+		ticker := time.NewTicker(100 * time.Millisecond)
+		defer ticker.Stop()
+		timeout := time.After(containerPendingTimeout)
+
+		for {
+			select {
+			case <-n.done:
+				return
+			case <-timeout:
+				log.Debugf("monitorRuntimeState: timeout waiting for state file %s", stateFile)
+				return
+			case <-ticker.C:
+				data, err := os.ReadFile(stateFile)
+				if err != nil {
+					continue
+				}
+
+				// runc's internal state.json uses "init_process_pid",
+				// NOT the OCI spec "pid" field. This is an internal
+				// runc/libcontainer format and is not covered by any
+				// stability guarantee.
+				var runcState struct {
+					InitProcessPid int `json:"init_process_pid"`
+				}
+				if err := json.Unmarshal(data, &runcState); err != nil {
+					continue
+				}
+				if runcState.InitProcessPid <= 0 {
+					continue
+				}
+
+				containerPID := runcState.InitProcessPid
+
+				// Coherence check: the init PID must be distinct from
+				// the intercepted runc process. This handles containers
+				// that share the host mount namespace (where checking
+				// mntns alone is not enough).
+				if runcPid > 0 && containerPID == runcPid {
+					continue
+				}
+
+				// Verify the init process is actually alive (not a stale
+				// state.json pointing at a recycled PID).
+				if err := syscall.Kill(containerPID, 0); err != nil && !errors.Is(err, syscall.EPERM) {
+					continue
+				}
+
+				if containerPID > math.MaxUint32 {
+					log.Errorf("monitorRuntimeState: PID %d exceeds MaxUint32", containerPID)
+					return
+				}
+
+				err = n.AddWatchContainerTermination(containerID, containerPID)
+				if err != nil {
+					log.Errorf("monitorRuntimeState: container %s terminated before watch: %s", containerID, err)
+					return
+				}
+
+				// Check for future container info (name from conmon)
+				var containerName string
+				n.futureMu.Lock()
+				fc, ok := n.futureContainers[containerID]
+				if ok {
+					containerName = fc.name
+				}
+				delete(n.futureContainers, containerID)
+				n.futureMu.Unlock()
+
+				// Re-read config.json for the callback (with size limit).
+				configJSON, err := readConfigJSON(configJSONPath)
+				if err != nil {
+					log.Errorf("monitorRuntimeState: could not read config.json: %s", err)
+					return
+				}
+
+				n.callback(ContainerEvent{
+					Type:            EventTypeAddContainer,
+					ContainerID:     containerID,
+					ContainerPID:    uint32(containerPID),
+					ContainerConfig: string(configJSON),
+					Bundle:          bundleDir,
+					ContainerName:   containerName,
+				})
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+// runcValueFlags lists runc/crun flags that take a separate value argument.
+// Knowing these is essential to parse the cmdline without mistaking flag
+// values (e.g. --console-socket /path) for the container-id positional.
+// Source: runc's urfave/cli flag definitions (global flags and the
+// create/run subcommand flags). Keep this list in sync with the runc docs.
+var runcValueFlags = map[string]bool{
+	// Global flags
+	"--log":        true,
+	"--log-format": true,
+	"--log-level":  true,
+	"--root":       true,
+	"--criu":       true,
+	"--rootless":   true,
+	// create / run flags
+	"--bundle":         true,
+	"-b":               true,
+	"--console-socket": true,
+	"--pid-file":       true,
+	"--preserve-fds":   true,
+}
+
+func splitFlag(arg string) (name, value string, hasValue bool) {
+	if eq := strings.IndexByte(arg, '='); eq != -1 {
+		return arg[:eq], arg[eq+1:], true
+	}
+	return arg, "", false
+}
+
+// ociRuntimeCmd holds the fields parsed from a runc/crun command line.
+type ociRuntimeCmd struct {
+	command     string // "create" or "run"; empty if neither found
+	bundleDir   string
+	pidFile     string
+	runcRoot    string
+	containerID string
+}
+
+// parseOCIRuntimeCmdline parses a runc/crun command line. This is a pure
+// function extracted from parseOCIRuntime so it can be unit-tested without
+// needing a live ContainerNotifier, fanotify, or filesystem state.
+//
+// Grammar:
+//
+//	runc [global-options] <command> [command-options] [--] <container-id>
+//
+// Value-taking flags (separate or = form) are recognized via runcValueFlags;
+// unknown flags are ignored to avoid misinterpreting their values as
+// positional arguments (e.g. `--console-socket /tmp/s.sock`).
+func parseOCIRuntimeCmdline(cmdlineArr []string) ociRuntimeCmd {
+	var p ociRuntimeCmd
+	commandFound := false
+
+	for i := 0; i < len(cmdlineArr); i++ {
+		arg := cmdlineArr[i]
+
+		if !commandFound {
+			if arg == "create" || arg == "run" {
+				p.command = arg
+				commandFound = true
+				continue
+			}
+			if runcValueFlags[arg] && i+1 < len(cmdlineArr) {
+				if arg == "--root" {
+					p.runcRoot = cmdlineArr[i+1]
+				}
+				i++
+				continue
+			}
+			if name, value, hasValue := splitFlag(arg); hasValue {
+				if name == "--root" {
+					p.runcRoot = value
+				}
+			}
+			continue
+		}
+
+		if arg == "--" {
+			if i+1 < len(cmdlineArr) {
+				p.containerID = cmdlineArr[i+1]
+			}
+			break
+		}
+
+		if runcValueFlags[arg] && i+1 < len(cmdlineArr) {
+			switch arg {
+			case "--bundle", "-b":
+				p.bundleDir = cmdlineArr[i+1]
+			case "--pid-file":
+				p.pidFile = cmdlineArr[i+1]
+			case "--root":
+				p.runcRoot = cmdlineArr[i+1]
+			}
+			i++
+			continue
+		}
+
+		if strings.HasPrefix(arg, "-") {
+			if name, value, hasValue := splitFlag(arg); hasValue {
+				switch name {
+				case "--bundle", "-b":
+					p.bundleDir = value
+				case "--pid-file":
+					p.pidFile = value
+				case "--root":
+					p.runcRoot = value
+				}
+			}
+			continue
+		}
+
+		p.containerID = arg
+		break
+	}
+
+	return p
+}
+
+func (n *ContainerNotifier) parseOCIRuntime(mntnsId uint64, runcPid int, cmdlineArr []string) {
+	// Parse oci-runtime (runc/crun) command line:
+	//   runc [global-options] <command> [command-options] [--] <container-id>
+	//
+	// Examples that must parse correctly:
+	//   runc create --bundle /b --pid-file /p myctr
+	//   runc --root /run/user/1000/runc run --console-socket /tmp/s.sock myctr
+	//   runc run --preserve-fds 3 --detach -- myctr
+	p := parseOCIRuntimeCmdline(cmdlineArr)
+	if p.command == "" {
+		return
+	}
+	bundleDir := p.bundleDir
+	pidFile := p.pidFile
+	runcRoot := p.runcRoot
+	containerID := p.containerID
+
+	// If --bundle was not specified, runc uses its CWD.
+	// Since the runc process is blocked by fanotify, we can read /proc/<pid>/cwd.
+	// NOTE: readlink returns the path as-is in the runc process's mount
+	// namespace. This is correct for host-resident runc; nested-runc
+	// scenarios may not resolve under host.HostRoot.
+	if bundleDir == "" && runcPid > 0 {
+		cwd, err := os.Readlink(filepath.Join(host.HostProcFs, fmt.Sprint(runcPid), "cwd"))
+		if err != nil {
+			log.Debugf("fanotify: could not read cwd for runc pid %d: %s", runcPid, err)
+			return
+		}
+		bundleDir = cwd
+	}
+
+	if bundleDir == "" {
+		return
+	}
+
+	bundleDir = filepath.Join(host.HostRoot, bundleDir)
+	if _, err := os.Stat(bundleDir); err != nil {
+		log.Debugf("fanotify: bundle dir %q not accessible: %s", bundleDir, err)
+		return
+	}
+
+	if pidFile != "" {
+		pidFile = filepath.Join(host.HostRoot, pidFile)
+		// Only override the bundle-derived containerID when we have a
+		// positional container-id from the cmdline AND the bundle
+		// basename disagrees (avoids disturbing the cri-o / podman-conmon
+		// correlation which relies on bundle-base == container-id).
+		override := ""
+		if containerID != "" {
+			bundleBase := filepath.Base(filepath.Clean(strings.TrimSuffix(bundleDir, "userdata")))
+			if bundleBase != containerID {
+				override = containerID
+			}
+		}
+		err := n.monitorRuntimeInstance(mntnsId, bundleDir, pidFile, override)
 		if err != nil {
 			log.Errorf("error monitoring runtime instance: %v\n", err)
 		}
+		return
 	}
+
+	// No --pid-file: poll runc state directory for state.json to get PID.
+	if containerID == "" {
+		log.Debugf("fanotify: runc/crun command without --pid-file and no container ID")
+		return
+	}
+
+	stateDir := resolveRuncStateDir(runcRoot, containerID)
+	if stateDir == "" {
+		log.Debugf("fanotify: could not locate runc state dir for %s", containerID)
+		return
+	}
+	err := n.monitorRuntimeState(bundleDir, stateDir, containerID, runcPid)
+	if err != nil {
+		log.Errorf("error monitoring runtime state: %v\n", err)
+	}
+}
+
+// resolveRuncStateDir picks the first existing state directory. If --root
+// was explicitly set, it is used unconditionally. Otherwise we probe the
+// common defaults for runc (/run/runc) and crun (/run/crun).
+func resolveRuncStateDir(runcRoot, containerID string) string {
+	if runcRoot != "" {
+		return filepath.Join(host.HostRoot, runcRoot, containerID)
+	}
+	for _, candidate := range []string{"/run/runc", "/run/crun"} {
+		dir := filepath.Join(host.HostRoot, candidate, containerID)
+		if _, err := os.Stat(dir); err == nil {
+			return dir
+		}
+	}
+	// Fall back to /run/runc (the goroutine will time out if it doesn't appear).
+	return filepath.Join(host.HostRoot, "/run/runc", containerID)
 }
 
 func (n *ContainerNotifier) watchRuntimeIterate() error {
@@ -991,7 +1340,7 @@ func (n *ContainerNotifier) watchRuntimeIterate() error {
 		// Calling sequence: crio/podman -> conmon -> runc/crun
 		n.parseConmonCmdline(cmdlineArr)
 	case "runc", "crun":
-		n.parseOCIRuntime(record.MntnsId, cmdlineArr)
+		n.parseOCIRuntime(record.MntnsId, int(record.Pid), cmdlineArr)
 	default:
 		return nil
 	}

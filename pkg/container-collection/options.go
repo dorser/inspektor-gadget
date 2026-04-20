@@ -860,6 +860,36 @@ func WithOCIConfigForInitialContainer() ContainerCollectionOption {
 	}
 }
 
+// WithRuncFallbackContainerEnrichment sets ContainerName and RuntimeName for
+// containers that were not enriched by any runtime client. This is needed for
+// direct runc/crun containers which are detected by the fanotify hook but have
+// no higher-level runtime (docker, containerd, etc.) to provide metadata.
+// Without ContainerName, TracerMapsUpdater skips the container and its mntns
+// is never added to the eBPF filter map.
+//
+// The fallback only fires when BOTH the ContainerName is empty and the
+// RuntimeName is empty or Unknown, so that a container which a real runtime
+// client is in the process of (or briefly failed to) enrich is not
+// permanently mis-labeled as runc.
+func WithRuncFallbackContainerEnrichment() ContainerCollectionOption {
+	return func(cc *ContainerCollection) error {
+		cc.containerEnrichers = append(cc.containerEnrichers, func(container *Container) bool {
+			if container.Runtime.ContainerID == "" {
+				return true
+			}
+			runtimeKnown := container.Runtime.RuntimeName != "" &&
+				container.Runtime.RuntimeName != types.RuntimeNameUnknown
+			if runtimeKnown || container.Runtime.ContainerName != "" {
+				return true
+			}
+			container.Runtime.ContainerName = container.Runtime.ContainerID
+			container.Runtime.RuntimeName = types.RuntimeNameRunc
+			return true
+		})
+		return nil
+	}
+}
+
 func readOciConfigFromPath(cfgPath string) (string, error) {
 	cfgData, err := os.Open(cfgPath)
 	if err != nil {

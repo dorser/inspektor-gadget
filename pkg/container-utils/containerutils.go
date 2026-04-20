@@ -32,6 +32,7 @@ import (
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/crio"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/docker"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/podman"
+	"github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runc"
 	runtimeclient "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/runtime-client"
 	containerutilsTypes "github.com/inspektor-gadget/inspektor-gadget/pkg/container-utils/types"
 	"github.com/inspektor-gadget/inspektor-gadget/pkg/types"
@@ -44,6 +45,7 @@ var AvailableRuntimes = []string{
 	types.RuntimeNameContainerd.String(),
 	types.RuntimeNameCrio.String(),
 	types.RuntimeNamePodman.String(),
+	types.RuntimeNameRunc.String(),
 }
 
 var AvailableRuntimeProtocols = []string{
@@ -77,6 +79,12 @@ func NewContainerRuntimeClient(runtime *containerutilsTypes.RuntimeConfig) (runt
 			socketPath = filepath.Join(host.HostRoot, envsp)
 		}
 		return podman.NewPodmanClient(socketPath), nil
+	case types.RuntimeNameRunc:
+		rootDir := runtime.SocketPath
+		if envsp := os.Getenv("INSPEKTOR_GADGET_RUNC_ROOTPATH"); envsp != "" && rootDir == "" {
+			rootDir = filepath.Join(host.HostRoot, envsp)
+		}
+		return runc.NewRuncClient(rootDir), nil
 	default:
 		return nil, fmt.Errorf("unknown container runtime: %s (available %s)",
 			runtime.Name, strings.Join(AvailableRuntimes, ", "))

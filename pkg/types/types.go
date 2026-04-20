@@ -88,6 +88,7 @@ const (
 	RuntimeNameContainerd RuntimeName = "containerd"
 	RuntimeNameCrio       RuntimeName = "cri-o"
 	RuntimeNamePodman     RuntimeName = "podman"
+	RuntimeNameRunc       RuntimeName = "runc"
 	RuntimeNameUnknown    RuntimeName = "unknown"
 )
 
@@ -101,6 +102,8 @@ func String2RuntimeName(name string) RuntimeName {
 		return RuntimeNameCrio
 	case string(RuntimeNamePodman):
 		return RuntimeNamePodman
+	case string(RuntimeNameRunc):
+		return RuntimeNameRunc
 	}
 	return RuntimeNameUnknown
 }

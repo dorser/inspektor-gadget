@@ -57,6 +57,7 @@ const (
 	ContainerdSocketPath   = "containerd-socketpath"
 	CrioSocketPath         = "crio-socketpath"
 	PodmanSocketPath       = "podman-socketpath"
+	RuncRootPath           = "runc-rootpath"
 	ContainerdNamespace    = "containerd-namespace"
 	RuntimeProtocol        = "runtime-protocol"
 	EnrichWithK8sApiserver = "enrich-with-k8s-apiserver"
@@ -130,6 +131,11 @@ func (l *localManager) GlobalParamDescs() params.ParamDescs {
 			Description:  "Podman Unix socket path",
 		},
 		{
+			Key:          RuncRootPath,
+			DefaultValue: runtimeclient.RuncDefaultRootPath,
+			Description:  "Runc root state directory path",
+		},
+		{
 			Key:          ContainerdNamespace,
 			DefaultValue: constants.K8sContainerdNamespace,
 			Description:  "Containerd namespace to use",
@@ -194,6 +200,8 @@ func (l *localManager) Init(operatorParams *params.Params) error {
 			socketPathParam = operatorParams.Get(CrioSocketPath)
 		case types.RuntimeNamePodman:
 			socketPathParam = operatorParams.Get(PodmanSocketPath)
+		case types.RuntimeNameRunc:
+			socketPathParam = operatorParams.Get(RuncRootPath)
 		default:
 			return commonutils.WrapInErrInvalidArg("--runtime / -r",
 				fmt.Errorf("runtime %q is not supported", runtime))
@@ -208,12 +216,23 @@ func (l *localManager) Init(operatorParams *params.Params) error {
 			continue
 		}
 
+		// For runc, the state directory may not exist yet (created on first
+		// container). Only error if the user explicitly set the path.
 		if _, err := os.Stat(cleanSocketPath); err != nil {
-			if socketPathIsSet || runtimesIsSet {
-				return fmt.Errorf("runtime %q with non-existent socketPath %q", runtimeName, socketPath)
+			if runtimeName == types.RuntimeNameRunc {
+				if socketPathIsSet || runtimesIsSet {
+					log.Debugf("Runc root dir %q does not exist yet, will be checked at enrichment time", socketPath)
+				} else {
+					log.Debugf("Ignoring runtime %q with non-existent root path %q", runtimeName, socketPath)
+					continue
+				}
+			} else {
+				if socketPathIsSet || runtimesIsSet {
+					return fmt.Errorf("runtime %q with non-existent socketPath %q", runtimeName, socketPath)
+				}
+				log.Debugf("Ignoring runtime %q with non-existent socketPath %q", runtimeName, socketPath)
+				continue
 			}
-			log.Debugf("Ignoring runtime %q with non-existent socketPath %q", runtimeName, socketPath)
-			continue
 		}
 
 		r := &containerutilsTypes.RuntimeConfig{
@@ -293,6 +312,13 @@ func (l *localManager) initCollections(rc []*containerutilsTypes.RuntimeConfig, 
 		containercollection.WithTracerCollection(l.tracerCollection),
 		containercollection.WithProcEnrichment(),
 	}...)
+
+	// Only enable the runc fallback when runc is an opted-in runtime. This
+	// prevents mis-labeling containers that are briefly missed by a
+	// higher-level runtime client (docker/containerd/etc.) as runc.
+	if hasRuncRuntime(rc) {
+		ccOpts = append(ccOpts, containercollection.WithRuncFallbackContainerEnrichment())
+	}
 
 	if kubeconfig != "" {
 		ccOpts = append(ccOpts, containercollection.WithKubeconfigPath(kubeconfig))
@@ -692,6 +718,15 @@ func (l *localManagerTraceWrapper) Close(gadgetCtx operators.GadgetContext) erro
 	return l.PostGadgetRun()
 }
 
+func hasRuncRuntime(runtimes []*containerutilsTypes.RuntimeConfig) bool {
+	for _, r := range runtimes {
+		if r.Name == types.RuntimeNameRunc {
+			return true
+		}
+	}
+	return false
+}
+
 func isDefaultContainerRuntimeConfig(runtimes []*containerutilsTypes.RuntimeConfig) bool {
 	if len(runtimes) != len(containerutils.AvailableRuntimes) {
 		return false
@@ -708,6 +743,8 @@ func isDefaultContainerRuntimeConfig(runtimes []*containerutilsTypes.RuntimeConf
 			customSocketPath = runtime.SocketPath != runtimeclient.CrioDefaultSocketPath
 		case types.RuntimeNamePodman:
 			customSocketPath = runtime.SocketPath != runtimeclient.PodmanDefaultSocketPath
+		case types.RuntimeNameRunc:
+			customSocketPath = runtime.SocketPath != runtimeclient.RuncDefaultRootPath
 		default:
 			customSocketPath = true
 		}

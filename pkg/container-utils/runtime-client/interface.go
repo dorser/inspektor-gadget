@@ -29,6 +29,8 @@ const (
 	ContainerdDefaultSocketPath = "/run/containerd/containerd.sock"
 	DockerDefaultSocketPath     = "/run/docker.sock"
 	CriDockerDefaultSocketPath  = "/run/cri-dockerd.sock"
+	RuncDefaultRootPath         = "/run/runc"
+	CrunDefaultRootPath         = "/run/crun"
 )
 
 var ErrPauseContainer = errors.New("it is a pause container")
