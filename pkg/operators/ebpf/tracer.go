@@ -48,6 +48,7 @@ type Tracer struct {
 	lostSampleMap *ebpf.Map
 	ringbufReader *ringbuf.Reader
 	perfReader    *perf.Reader
+	perfFlush     time.Duration // perf buffer flush interval; 0 = wake on every event
 	slowBuf       []byte
 	logger        logger.Logger
 }
@@ -182,6 +183,13 @@ func (t *Tracer) receiveEvents(gadgetCtx operators.GadgetContext, wg *sync.WaitG
 	case ebpf.PerfEventArray:
 		var rec perf.Record
 		readCb = func() ([]byte, uint64, error) {
+			// When wakeup batching is enabled (perfFlush > 0), bound the added
+			// latency by waking at least every perfFlush to drain partial
+			// batches. ReadInto returns any buffered records before reporting
+			// os.ErrDeadlineExceeded, so no event is delayed beyond perfFlush.
+			if t.perfFlush > 0 {
+				t.perfReader.SetDeadline(time.Now().Add(t.perfFlush))
+			}
 			err := t.perfReader.ReadInto(&rec)
 			return rec.RawSample, rec.LostSamples, err
 		}
@@ -195,6 +203,11 @@ func (t *Tracer) receiveEvents(gadgetCtx operators.GadgetContext, wg *sync.WaitG
 		if err != nil {
 			if errors.Is(err, os.ErrClosed) {
 				return err
+			}
+			// A flush deadline tick with no pending records is expected when
+			// wakeup batching is enabled; it is not an error.
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
 			}
 			gadgetCtx.Logger().Warnf("error reading event: %v", err)
 			continue
@@ -301,8 +314,11 @@ func (i *ebpfInstance) runTracer(gadgetCtx operators.GadgetContext, tracer *Trac
 		tracer.lostSampleMap = lostSamplesMap
 		tracer.logger = i.logger
 	case ebpf.PerfEventArray:
-		i.logger.Debugf("creating perf reader for map %q", tracer.mapName)
-		tracer.perfReader, err = perf.NewReader(m, gadgets.PerfBufferPages*os.Getpagesize())
+		tuning := perfReaderTuning()
+		tracer.perfFlush = tuning.flush
+		i.logger.Debugf("creating perf reader for map %q (pages=%d, wakeup_events=%d, flush=%s)",
+			tracer.mapName, tuning.pages, tuning.options.WakeupEvents, tuning.flush)
+		tracer.perfReader, err = perf.NewReaderWithOptions(m, tuning.pages*os.Getpagesize(), tuning.options)
 	default:
 		return fmt.Errorf("unknown type for tracer map %q", tracer.mapName)
 	}
